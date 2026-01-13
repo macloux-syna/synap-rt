@@ -1,8 +1,11 @@
 from abc import ABC, abstractmethod
 from signal import SIGINT
 from typing import Any, Callable
+from synap.postprocessor import DetectorResult, DetectorResultItem
+
 import logging
 import os
+import cv2
 
 import numpy as np
 import gi
@@ -108,7 +111,7 @@ class GstBaseRunner(BaseRunner):
         self._pipeline: Gst.Element | None = None
         self._bus_watch_id: int = 0
         self._main_loop: Gst.Element | None = None
-    
+
     def _cleanup(self) -> None:
         """
         Clean up GStreamer pipeline and exit the program.
@@ -126,7 +129,7 @@ class GstBaseRunner(BaseRunner):
     def initialize(self) -> None:
         """
         Initialize the GStreamer pipeline.
-        
+
         :raises RuntimeError: If pipeline initialization fails
         """
         Gst.init(None)
@@ -148,9 +151,11 @@ class GstBaseRunner(BaseRunner):
             raise RuntimeError(
                 f"Fatal: Failed to initialize GStreamer pipeline:\n\"{pipeline_str_full}\""
             )
-        
+
         bus = self._pipeline.get_bus()
         self._bus_watch_id = bus.add_watch(GLib.PRIORITY_DEFAULT, bus_call, self._main_loop)
+
+        self._appsrc = self._pipeline.get_by_name("disp_src")
 
         appsink = self._pipeline.get_by_name(appsink_name)
         if not appsink:
@@ -162,7 +167,7 @@ class GstBaseRunner(BaseRunner):
         appsink.set_property("sync", True)
         appsink.connect("new-sample", self._on_new_sample)
         self.connect()
-    
+
         GLib.unix_signal_add(
             GLib.PRIORITY_HIGH, int(SIGINT), handle_sigint, self._main_loop, self._pipeline
         )
@@ -173,7 +178,7 @@ class GstBaseRunner(BaseRunner):
             logger.error(f"Error: Failed to set pipeline to PLAYING. Current state: {state}")
             self._cleanup()
             raise RuntimeError(f"Fatal: Failed to start GStreamer pipeline")
-        
+
     def pause(self):
         """
         Pause the GStreamer pipeline if pipeline is valid.
@@ -201,7 +206,7 @@ class GstBaseRunner(BaseRunner):
                 logger.error(f"Error: Failed to set pipeline to PLAYING. Current state: {state}")
                 self._cleanup()
                 raise RuntimeError(f"Fatal: Failed to resume GStreamer pipeline")
-            
+
 
     def run(self) -> None:
         """
@@ -217,12 +222,12 @@ class GstBaseRunner(BaseRunner):
 
     def connect(self) -> None:
         pass
-    
+
     @abstractmethod
     def _on_new_sample(self, app_sink: Gst.Element) -> Gst.FlowReturn:
         """
         Callback function for new samples from GStreamer appsink.
-        
+
         :param app_sink: GStreamer appsink element
         :type app_sink: Gst.Element
         :return: GStreamer flow return status
@@ -264,7 +269,7 @@ class GstAudioRunner(GstBaseRunner):
     def _on_new_sample(self, app_sink: Gst.Element) -> Gst.FlowReturn:
         """
         Callback function for new audio samples from GStreamer appsink.
-        
+
         :param app_sink: GStreamer appsink element
         :type app_sink: Gst.Element
         :return: GStreamer flow return status
@@ -316,7 +321,7 @@ class GstAudioRunner(GstBaseRunner):
     def process_inputs(self) -> None:
         """
         Process input and prepare for inference.
-        
+
         :raises TypeError: If non-audio input is received
         :raises ValueError: If multiple inputs are received
         :raises ValueError: input is "mic" and no available microphones are detected
@@ -343,7 +348,7 @@ class GstAudioRunner(GstBaseRunner):
 class GstVideoRunner(GstBaseRunner):
     """
     GStreamer-based video inference runner.
-    
+
     :param inputs_info: List of tuples containing input data and its type
     :type inputs_info: list[tuple[str | os.PathLike, DataType]]
     :param infer_func: Inference function to run on input data
@@ -376,11 +381,104 @@ class GstVideoRunner(GstBaseRunner):
         else:
             self._overlay = None
         self._inf_skip_counter: int = self._skip_frames
-    
+
+    def _pixelate_roi(self, img, x, y, w, h, block=18):
+        H, W = img.shape[:2]
+        x1 = max(0, x); y1 = max(0, y)
+        x2 = min(W, x + w); y2 = min(H, y + h)
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return
+        rh, rw = roi.shape[:2]
+        rw2 = max(1, rw // block)
+        rh2 = max(1, rh // block)
+        small = cv2.resize(roi, (rw2, rh2), interpolation=cv2.INTER_LINEAR)
+        pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+        img[y1:y2, x1:x2] = pix
+
+    def _head_roi(self, pts, ox, oy, bw, bh, pad=50):
+        # head points 0..4
+        xs, ys = [], []
+        for i in (0,1,2,3,4):
+            if pts and pts[i] is not None:
+                x, y, _ = pts[i]
+                xs.append(x); ys.append(y)
+
+        if not xs:
+            return None
+
+        x1 = int(min(xs)) - pad
+        y1 = int(min(ys)) - pad
+        x2 = int(max(xs)) + pad
+        y2 = int(max(ys)) + pad
+
+        # estimate head size from shoulder width if available, else bbox width
+        LS, RS = 5, 6
+        shoulder_w = None
+        if pts and pts[LS] is not None and pts[RS] is not None:
+            shoulder_w = abs(float(pts[RS][0]) - float(pts[LS][0]))
+
+        min_w = int((shoulder_w * 0.55) if shoulder_w else (bw * 0.35))
+        min_h = int(min_w * 1.2)
+
+        # expand to minimum size around center of current head box
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        if (x2 - x1) < min_w:
+            x1 = cx - min_w // 2
+            x2 = cx + min_w // 2
+        if (y2 - y1) < min_h:
+            y1 = cy - min_h // 2
+            y2 = cy + min_h // 2
+
+        return (x1, y1, x2 - x1, y2 - y1)
+
+    def _body_roi(self, pts, pad=50):
+        """
+        pts: list[17] of None or (x,y,score)
+        returns (x,y,w,h) or None
+        """
+        # body-related indices (no head)
+        idxs = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # +wrists
+
+        xs, ys = [], []
+        for i in idxs:
+            if pts and i < len(pts) and pts[i] is not None:
+                x, y, _ = pts[i]
+                xs.append(x); ys.append(y)
+
+        if len(xs) < 3:
+            return None
+
+        x1 = int(min(xs)) - pad
+        y1 = int(min(ys)) - pad
+        x2 = int(max(xs)) + pad
+        y2 = int(max(ys)) + pad
+        return (x1, y1, x2 - x1, y2 - y1)
+
+    def _lower_body_bbox(self, ox, oy, bw, bh, head, min_gap=6):
+        if not head:
+            return (ox, oy, bw, bh)
+        hx, hy, hw, hh = head
+        new_y = hy + hh + min_gap
+        new_h = (oy + bh) - new_y
+        if new_h <= 0:
+            return None
+        return (ox, new_y, bw, new_h)
+
+    def _clamp_roi(self, x, y, w, h, W, H):
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(W, x + w)
+        y2 = min(H, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2 - x1, y2 - y1)
+
     def _on_new_sample(self, app_sink: Gst.Element) -> Gst.FlowReturn:
         """
         Callback function for new video samples from GStreamer appsink.
-        
+
         :param app_sink: GStreamer appsink element
         :type app_sink: Gst.Element
         :return: GStreamer flow return status
@@ -389,7 +487,7 @@ class GstVideoRunner(GstBaseRunner):
         if self._inf_skip_counter > 0:
             self._inf_skip_counter -= 1
             return Gst.FlowReturn.OK
-        
+
         self._inf_skip_counter = self._skip_frames
         sample = app_sink.emit("pull-sample")
         caps = sample.get_caps()
@@ -401,25 +499,103 @@ class GstVideoRunner(GstBaseRunner):
         if not success:
             raise RuntimeError("Error: Could not map buffer data")
 
-        data = np.ndarray(
-            shape=(height, width, 3),
-            dtype=np.uint8,
-            buffer=map_info.data)
-
-        buffer.unmap(map_info)
-
         try:
-            self._infer_func([data])
-        except RuntimeError as e:
-            logger.error(f"Fatal: Inference failed: {e}")
+            frame = np.ndarray((height, width, 3), dtype=np.uint8, buffer=map_info.data).copy()
+        finally:
+            buffer.unmap(map_info)
+
+        # inference every N frames (but always display)
+        run_inf = (self._inf_skip_counter <= 0)
+        if run_inf:
+            self._inf_skip_counter = self._skip_frames
+            try:
+                self._infer_func([frame])
+            except RuntimeError as e:
+                logger.error(f"Fatal: Inference failed: {e}")
+                return Gst.FlowReturn.ERROR
+        else:
+            self._inf_skip_counter -= 1
+
+        # pixelate using latest results
+        results = self._overlay._results_provider() if self._overlay else None
+        if results:
+            items = results.items if isinstance(results, DetectorResult) else (results.get("items", []) if isinstance(results, dict) else [])
+        for it in items:
+            # if your pose model still uses class_index 0 for person, keep this
+            cls = int(it.class_index)
+            if cls != 0:
+                continue
+
+            bb = it.bounding_box
+            ox = int(bb.origin.x)
+            oy = int(bb.origin.y)
+            bw = int(bb.size.x)
+            bh = int(bb.size.y)
+
+            # landmarks: list of points with x/y/visibility (or None)
+            lm_pts = None
+            try:
+                lm = it.landmarks
+                if lm and len(lm) == 17:
+                    # convert to same format (x,y,score)
+                    lm_pts = []
+                    for p in lm:
+                        # visibility sometimes used as score
+                        sc = float(getattr(p, "visibility", 1.0))
+                        lm_pts.append((float(p.x), float(p.y), sc))
+            except Exception:
+                lm_pts = None
+
+            force_head = {0,1,2,3,4}      # nose/eyes/ears
+            pts17 = []
+
+            for i, (x, y, sc) in enumerate(lm_pts):
+                # keep head/hands even if low confidence
+                if sc >= 0.3 or (i in (force_head)):
+                    pts17.append((x, y, sc))
+                else:
+                    pts17.append(None)
+
+            H, W = frame.shape[:2]
+
+            # head ROI (your existing function)
+            head = self._head_roi(pts17, ox, oy, bw, bh)
+            head = self._clamp_roi(*head, W, H) if head else None
+
+            # body ROI from landmarks
+            body = self._body_roi(pts17)
+            body = self._clamp_roi(*body, W, H) if body else None
+
+            if not body:
+                body = self._lower_body_bbox(ox, oy, bw, bh, head, min_gap=6)
+                body = self._clamp_roi(*body, W, H) if body else None
+
+            head_block = 6
+            body_block = 10
+
+            # pixelate body (from landmarks)
+            if body:
+                self._pixelate_roi(frame, *body, block=body_block)
+            if head:
+                self._pixelate_roi(frame, *head, block=head_block)
+
+        # push to display
+        if not getattr(self, "_appsrc", None):
             return Gst.FlowReturn.ERROR
+
+        out = Gst.Buffer.new_allocate(None, frame.nbytes, None)
+        out.fill(0, frame.tobytes())
+        out.pts = buffer.pts
+        out.dts = buffer.dts
+        out.duration = buffer.duration
+        self._appsrc.emit("push-buffer", out)
 
         return Gst.FlowReturn.OK
 
     def process_inputs(self) -> None:
         """
         Process input and prepare for inference.
-        
+
         :raises TypeError: If non-video input is received
         :raises ValueError: If multiple inputs are received
         :raises ValueError: If input is "cam" and no available cameras are detected
@@ -439,20 +615,24 @@ class GstVideoRunner(GstBaseRunner):
                 )
 
         src = get_video_input_elems(input, input_type)
-        infer_branch: str = (
+        infer_branch = (
             f"videoconvert ! videoscale "
             f"! video/x-raw,format=RGB,width={self._model_inp_width},height={self._model_inp_height} "
             f"! appsink name=infer_sink "
         )
-        if not self._overlay:
-            self._pipeline_str = f"{src} ! queue max-size-buffers=1 leaky=downstream ! {infer_branch}"
-        else:
-            overlay_branch = self._overlay.pipeline
-            self._pipeline_str = (
-                f"{src} ! tee name=t "
-                f"t. ! queue max-size-buffers=1 leaky=downstream ! {infer_branch} "
-                f"t. ! queue ! {overlay_branch}"
-            )
+
+        display_branch = (
+            f"appsrc name=disp_src is-live=true format=time do-timestamp=true block=false "
+            f"caps=video/x-raw,format=RGB,width={self._model_inp_width},height={self._model_inp_height},framerate=30/1 "
+            f"! queue max-size-buffers=1 leaky=downstream "
+            f"! videoconvert ! video/x-raw,format=BGRA "
+            f"! cairooverlay name=overlay "
+            f"! waylandsink sync=false async=false fullscreen=true"
+        )
+        self._pipeline_str = (
+            f"{src} ! queue max-size-buffers=1 leaky=downstream ! "
+            f"{infer_branch} {display_branch}"
+        )
 
     def connect(self) -> None:
         super().connect()
@@ -485,7 +665,7 @@ class ImageRunner(BaseRunner):
     def process_inputs(self) -> None:
         """
         Process input and prepare for inference.
-        
+
         :raises TypeError: If non-image input is received
         :raises ValueError: If no valid image inputs are received
         """
@@ -502,7 +682,7 @@ class ImageRunner(BaseRunner):
 
     def pause(self) -> None:
         pass
-    
+
     def resume(self) -> None:
         pass
 
