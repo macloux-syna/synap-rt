@@ -705,7 +705,6 @@ class GstVideoRunner(GstBaseRunner):
             f"! videoconvert ! video/x-raw,format=BGRA "
             f"! cairooverlay name=overlay "
         )
-
         if self._save_file:
             display_branch = (
                 f"{display_base} ! tee name=t "
@@ -718,7 +717,7 @@ class GstVideoRunner(GstBaseRunner):
             )
         else:
             display_branch = (
-                f"{display_base} ! waylandsink sync=false async=false "
+                f"{display_base} ! waylandsink sync=false async=false fullscreen=true "
             )
 
         self._pipeline_str = (

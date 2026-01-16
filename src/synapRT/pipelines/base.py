@@ -450,7 +450,7 @@ class SynapBasePipeline(BasePipeline):
         self._assigned_rect: Rect | None = None
         self._results_raw: ClassifierResult | DetectorResult | None = None
         self._no_overlay: bool = str(infer_params.get("no_overlay", False)).lower() == "true"
-        self._save_file: str = str(infer_params.get("save_file", False)).lower()
+        self._save_file: str = infer_params.get("save_file", None)
 
     def _init_runner(self):
         super()._init_runner()
