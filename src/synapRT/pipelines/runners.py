@@ -29,6 +29,23 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def handle_sigint_safe(loop: GLib.MainLoop, pipeline: Gst.Element) -> bool:
+    """
+    Local signal handler to ensure video saves correctly on Ctrl+C.
+    """
+    print("\nCaught Ctrl+C! Finalizing video file... (Please wait 2s)")
+
+    if pipeline:
+        # 1. Send EOS (End of Stream) to finish the MP4 file
+        pipeline.send_event(Gst.Event.new_eos())
+
+        # 2. Schedule a forced quit in 3 seconds (safety net)
+        # The main 'bus_call' should quit sooner when it sees the EOS message.
+        GLib.timeout_add_seconds(3, loop.quit)
+
+    return GLib.SOURCE_REMOVE
+
+
 class BaseRunner(ABC):
     """
     Abstract base class for inference runners.
@@ -169,7 +186,7 @@ class GstBaseRunner(BaseRunner):
         self.connect()
 
         GLib.unix_signal_add(
-            GLib.PRIORITY_HIGH, int(SIGINT), handle_sigint, self._main_loop, self._pipeline
+            GLib.PRIORITY_HIGH, int(SIGINT), handle_sigint_safe, self._main_loop, self._pipeline
         )
 
         self._pipeline.set_state(Gst.State.PLAYING)
@@ -370,12 +387,15 @@ class GstVideoRunner(GstBaseRunner):
         results_provider: tuple[str, Callable[[], Any]] | None = None,
         skip_frames: int | None = None,
         show_overlay: bool = True,
+        save_file: str | None = None,
     ):
         super().__init__(inputs_info, infer_func)
 
         self._model_inp_width = model_inp_width
         self._model_inp_height = model_inp_height
         self._skip_frames = skip_frames or DEFAULT_SKIP_FRAMES
+        self._save_file = save_file
+
         if show_overlay and results_provider:
             self._overlay = overlay_factory(*results_provider, model_inp_width, model_inp_height)
         else:
@@ -396,8 +416,8 @@ class GstVideoRunner(GstBaseRunner):
         pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
         img[y1:y2, x1:x2] = pix
 
-    def _head_roi(self, pts, ox, oy, bw, bh, pad=50):
-        # head points 0..4
+    def _head_roi(self, pts, ox, oy, bw, bh, pad=20):
+        # 1. Gather Face Points (Nose, Eyes, Ears)
         xs, ys = [], []
         for i in (0,1,2,3,4):
             if pts and pts[i] is not None:
@@ -407,39 +427,64 @@ class GstVideoRunner(GstBaseRunner):
         if not xs:
             return None
 
+        # 2. Determine Horizontal range (Left/Right)
         x1 = int(min(xs)) - pad
-        y1 = int(min(ys)) - pad
         x2 = int(max(xs)) + pad
+
+        # 3. Determine Top (Forehead/Hair)
+        # Use the highest point: either the highest landmark or the BBox top
+        landmark_top = int(min(ys)) - pad
+        y1 = min(landmark_top, oy)
+
+        # 4. Determine Bottom (Chin/Neck)
+        # Start with the lowest face landmark (usually nose)
         y2 = int(max(ys)) + pad
 
-        # estimate head size from shoulder width if available, else bbox width
+        # Try to find shoulders (indices 5 and 6) to cover the neck
+        shoulders = []
+        if pts and len(pts) > 6:
+            if pts[5]: shoulders.append(pts[5][1]) # Left Shoulder
+            if pts[6]: shoulders.append(pts[6][1]) # Right Shoulder
+
+        if shoulders:
+            # Extend pixelation down to the shoulder line
+            shoulder_line = int(min(shoulders))
+            # Ensure we go at least to the shoulders, or keep existing bottom if it's lower
+            y2 = max(y2, shoulder_line)
+        else:
+            # Fallback: If no shoulders found, add extra padding for chin
+            y2 += pad * 2
+
+        # 5. Enforce Minimum Size Constraints
+        # Estimate head width from shoulders or bbox
         LS, RS = 5, 6
         shoulder_w = None
-        if pts and pts[LS] is not None and pts[RS] is not None:
+        if pts and pts[LS] and pts[RS]:
             shoulder_w = abs(float(pts[RS][0]) - float(pts[LS][0]))
 
         min_w = int((shoulder_w * 0.55) if shoulder_w else (bw * 0.35))
         min_h = int(min_w * 1.2)
 
-        # expand to minimum size around center of current head box
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        if (x2 - x1) < min_w:
-            x1 = cx - min_w // 2
-            x2 = cx + min_w // 2
-        if (y2 - y1) < min_h:
-            y1 = cy - min_h // 2
-            y2 = cy + min_h // 2
+        # Expand Width (Centered)
+        current_w = x2 - x1
+        if current_w < min_w:
+            center_x = (x1 + x2) // 2
+            x1 = center_x - min_w // 2
+            x2 = center_x + min_w // 2
+
+        # Expand Height (Downwards only, to protect the fixed Top)
+        current_h = y2 - y1
+        if current_h < min_h:
+            y2 = y1 + min_h
 
         return (x1, y1, x2 - x1, y2 - y1)
 
-    def _body_roi(self, pts, pad=50):
+    def _body_roi(self, pts, ox, oy, bw, bh, pad=20):
         """
-        pts: list[17] of None or (x,y,score)
-        returns (x,y,w,h) or None
+        Calculates body ROI by combining Landmarks (skeleton) and Bounding Box (volume).
         """
-        # body-related indices (no head)
-        idxs = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # +wrists
+        # body-related indices (shoulders, elbows, hips, knees, ankles, wrists)
+        idxs = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
         xs, ys = [], []
         for i in idxs:
@@ -450,21 +495,54 @@ class GstVideoRunner(GstBaseRunner):
         if len(xs) < 3:
             return None
 
-        x1 = int(min(xs)) - pad
-        y1 = int(min(ys)) - pad
-        x2 = int(max(xs)) + pad
-        y2 = int(max(ys)) + pad
+        # 1. Get the "Skeleton" box from landmarks
+        lx1 = int(min(xs)) - pad
+        ly1 = int(min(ys)) - pad
+        lx2 = int(max(xs)) + pad
+        ly2 = int(max(ys)) + pad
+
+        # 2. Get the "Person" box from the detector
+        bx1 = ox
+        bx2 = ox + bw
+        by2 = oy + bh
+        # Note: We don't use bbox top (oy) because that's the head.
+
+        # 3. Merge them for maximum safety
+        # Expand Left/Right to the widest known point (Skeleton OR BBox)
+        x1 = min(lx1, bx1)
+        x2 = max(lx2, bx2)
+
+        # Expand Bottom to the lowest known point (usually feet/bbox bottom)
+        y2 = max(ly2, by2)
+
+        # Keep Top at the shoulders (landmark top) so we don't double-pixelate the face
+        y1 = ly1
+
         return (x1, y1, x2 - x1, y2 - y1)
 
-    def _lower_body_bbox(self, ox, oy, bw, bh, head, min_gap=6):
+    def _lower_body_bbox(self, ox, oy, bw, bh, head, overlap=2):
         if not head:
+            # If no head detected, body is the full bounding box
             return (ox, oy, bw, bh)
+
         hx, hy, hw, hh = head
-        new_y = hy + hh + min_gap
-        new_h = (oy + bh) - new_y
+
+        # Start the body slightly higher than the bottom of the head
+        # to ensure they merge seamlessly.
+        head_bottom = hy + hh
+        new_y = head_bottom - overlap
+
+        # Security check: Ensure we don't go higher than the person's bounding box
+        new_y = max(new_y, oy)
+
+        # Calculate height: extend from new_y down to the bottom of the original bbox
+        bbox_bottom = oy + bh
+        new_h = bbox_bottom - new_y
+
         if new_h <= 0:
             return None
-        return (ox, new_y, bw, new_h)
+
+        return (ox, int(new_y), bw, int(new_h))
 
     def _clamp_roi(self, x, y, w, h, W, H):
         x1 = max(0, x)
@@ -563,21 +641,20 @@ class GstVideoRunner(GstBaseRunner):
             head = self._clamp_roi(*head, W, H) if head else None
 
             # body ROI from landmarks
-            body = self._body_roi(pts17)
+            body = self._body_roi(pts17, ox, oy, bw, bh)
             body = self._clamp_roi(*body, W, H) if body else None
 
             if not body:
-                body = self._lower_body_bbox(ox, oy, bw, bh, head, min_gap=6)
+                body = self._lower_body_bbox(ox, oy, bw, bh, head, overlap=4)
                 body = self._clamp_roi(*body, W, H) if body else None
 
-            head_block = 6
-            body_block = 10
+            block = 8
 
             # pixelate body (from landmarks)
             if body:
-                self._pixelate_roi(frame, *body, block=body_block)
+                self._pixelate_roi(frame, *body, block=block)
             if head:
-                self._pixelate_roi(frame, *head, block=head_block)
+                self._pixelate_roi(frame, *head, block=block)
 
         # push to display
         if not getattr(self, "_appsrc", None):
@@ -621,14 +698,29 @@ class GstVideoRunner(GstBaseRunner):
             f"! appsink name=infer_sink "
         )
 
-        display_branch = (
+        display_base = (
             f"appsrc name=disp_src is-live=true format=time do-timestamp=true block=false "
             f"caps=video/x-raw,format=RGB,width={self._model_inp_width},height={self._model_inp_height},framerate=30/1 "
             f"! queue max-size-buffers=1 leaky=downstream "
             f"! videoconvert ! video/x-raw,format=BGRA "
             f"! cairooverlay name=overlay "
-            f"! waylandsink sync=false async=false fullscreen=true"
         )
+
+        if self._save_file:
+            display_branch = (
+                f"{display_base} ! tee name=t "
+                # Branch 1: Display
+                f"t. ! queue leaky=downstream ! waylandsink sync=false async=false "
+                # Branch 2: File Recording
+                f"t. ! queue "
+                f"! videoconvert ! v4l2h264enc ! h264parse ! mp4mux "
+                f"! filesink location={self._save_file} async=false "
+            )
+        else:
+            display_branch = (
+                f"{display_base} ! waylandsink sync=false async=false "
+            )
+
         self._pipeline_str = (
             f"{src} ! queue max-size-buffers=1 leaky=downstream ! "
             f"{infer_branch} {display_branch}"

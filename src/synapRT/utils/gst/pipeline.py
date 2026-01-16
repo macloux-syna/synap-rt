@@ -30,7 +30,8 @@ def handle_sigint(loop: GLib.MainLoop, pipeline: Gst.Element) -> bool:
 
     logger.info("Caught Ctrl+C, stopping playback")
     if pipeline is not None:
-        pipeline.set_state(Gst.State.NULL)
+        pipeline.send_event(Gst.Event.new_eos())
+        GLib.timeout_add_seconds(2, lambda: loop.quit())
     loop.quit()
     return GLib.SOURCE_REMOVE
 
@@ -99,7 +100,7 @@ def get_video_input_elems(input: str, input_type: DataType) -> str:
     """
 
     if input_type == DataType.VID_CAM:
-        return f"v4l2src device={input} ! video/x-raw,framerate=30/1,format=YUY2,width=640,height=480"
+        return f"v4l2src device={input} ! video/x-raw,framerate=30/1,format=YUY2,width=1920,height=1080"
     elif input_type == DataType.VID_FILE:
         return f"filesrc location={input} ! qtdemux name=demux demux.video_0 ! h264parse ! avdec_h264"
     elif input_type == DataType.VID_RTSP:

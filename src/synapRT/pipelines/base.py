@@ -450,6 +450,7 @@ class SynapBasePipeline(BasePipeline):
         self._assigned_rect: Rect | None = None
         self._results_raw: ClassifierResult | DetectorResult | None = None
         self._no_overlay: bool = str(infer_params.get("no_overlay", False)).lower() == "true"
+        self._save_file: str = str(infer_params.get("save_file", False)).lower()
 
     def _init_runner(self):
         super()._init_runner()
@@ -464,6 +465,7 @@ class SynapBasePipeline(BasePipeline):
             ),
             skip_frames=self._runner_params.get("skip_frames"),
             show_overlay=not self._no_overlay,
+            save_file=self._save_file
         )
 
     def _result_to_dict(self, result: ClassifierResult | DetectorResult) -> dict:
