@@ -36,7 +36,7 @@ source .venv/bin/activate
 Next, install the [latest release](https://github.com/spal-synaptics/SyNAP-Infer-RT/releases) directly on your Astra board:
 
 ```bash
-pip install https://github.com/synaptics-synap/synap-rt/releases/download/v0.0.2-preview/synap_rt-0.0.2-py3-none-any.whl
+pip install -e synap-rt
 ```
 
 ### Simple Object Detection Pipeline
@@ -48,30 +48,32 @@ A SynapRT pipeline requires three key components: a task, a SyNAP model, and an 
 
 import json
 import sys
-
+ 
 from synapRT.pipelines import pipeline
-
-
-def handle_inference_result(results, inference_time=None):
-    # simple handler that writes the results to stdout
-    sys.stdout.write("\033[H\033[J")
-    formatted_json = json.dumps(results, indent=4)
-    print(formatted_json, flush=True)
-    sys.stdout.flush()
-    if inference_time:
-        print(f"Avg. inference time: {inference_time} ms", flush=True)
-    sys.stdout.flush()
-
-# define pipeline
-pipe = pipeline(
-    task="object-detection",
-    model="/usr/share/synap/models/object_detection/coco/model/yolov8s-640x384/model.synap",
-    profile=True, # enable inference time profiling
-    handler=handle_inference_result,
-)
-
-# run pipeline with inputs
-pipe(sys.argv[1])
+ 
+ 
+def main():
+ 
+    output_file = sys.argv[2] if len(sys.argv) > 2 else None
+ 
+    def handle_results(results, inference_time):
+        print(f"Inference Time: {inference_time:.0f} ms")
+ 
+    pipe = pipeline(
+        task="object-detection",
+        model="/usr/share/synap/models/object_detection/body_pose/model/yolov8s-pose/model.synap",
+        save_file=output_file,
+    )
+ 
+    print(f"Starting Object Detection Stream.")
+    if output_file:
+        print(f"Recording to: {output_file} (Press Ctrl+C to save and exit)")
+ 
+    pipe(sys.argv[1])
+ 
+ 
+if __name__ == "__main__":
+    main()
 ```
 
 Run the above pipeline with:
