@@ -450,6 +450,8 @@ class SynapBasePipeline(BasePipeline):
         self._assigned_rect: Rect | None = None
         self._results_raw: ClassifierResult | DetectorResult | None = None
         self._no_overlay: bool = str(infer_params.get("no_overlay", False)).lower() == "true"
+        self._pixelate: bool = str(infer_params.get("pixelate", False)).lower() == "true"
+        self._detect_fall: bool = str(infer_params.get("detect_fall", False)).lower() == "true"
         self._save_file: str = infer_params.get("save_file", None)
 
     def _init_runner(self):
@@ -465,6 +467,8 @@ class SynapBasePipeline(BasePipeline):
             ),
             skip_frames=self._runner_params.get("skip_frames"),
             show_overlay=not self._no_overlay,
+            pixelate=self._pixelate,
+            detect_fall=self._detect_fall,
             save_file=self._save_file
         )
 

@@ -387,6 +387,8 @@ class GstVideoRunner(GstBaseRunner):
         results_provider: tuple[str, Callable[[], Any]] | None = None,
         skip_frames: int | None = None,
         show_overlay: bool = True,
+        detect_fall: bool = True,
+        pixelate: bool = True,
         save_file: str | None = None,
     ):
         super().__init__(inputs_info, infer_func)
@@ -394,6 +396,11 @@ class GstVideoRunner(GstBaseRunner):
         self._model_inp_width = model_inp_width
         self._model_inp_height = model_inp_height
         self._skip_frames = skip_frames or DEFAULT_SKIP_FRAMES
+        self._pixelate = pixelate
+        self._detect_fall = detect_fall
+        self._fall_alert = False
+        self._fall_alert_countdown = 0
+        self._fall_alert_frames = 30  # ~1s at 30fps
         self._save_file = save_file
 
         if show_overlay and results_provider:
@@ -553,6 +560,37 @@ class GstVideoRunner(GstBaseRunner):
             return None
         return (x1, y1, x2 - x1, y2 - y1)
 
+    def _hand_touching_head(self, pts, ox, oy, bw, bh) -> bool:
+        """
+        Simulate fall detection when a wrist is close to head landmarks.
+        Uses COCO pose indices:
+        head: 0 nose, 1/2 eyes, 3/4 ears
+        hands: 9 left wrist, 10 right wrist
+        """
+        hand_head_threshold = 0.18
+
+        if not pts:
+            return False
+
+        head_idxs = [0, 1, 2, 3, 4]
+        hand_idxs = [9, 10]
+
+        head_pts = [pts[i] for i in head_idxs if i < len(pts) and pts[i] is not None]
+        hand_pts = [pts[i] for i in hand_idxs if i < len(pts) and pts[i] is not None]
+
+        if not head_pts or not hand_pts:
+            return False
+
+        threshold = max(20.0, bh * hand_head_threshold)
+
+        for hx, hy, _ in head_pts:
+            for wx, wy, _ in hand_pts:
+                dist = ((wx - hx) ** 2 + (wy - hy) ** 2) ** 0.5
+                if dist <= threshold:
+                    return True
+
+        return False
+
     def _on_new_sample(self, app_sink: Gst.Element) -> Gst.FlowReturn:
         """
         Callback function for new video samples from GStreamer appsink.
@@ -595,9 +633,11 @@ class GstVideoRunner(GstBaseRunner):
             self._inf_skip_counter -= 1
 
         # pixelate using latest results
+        items = []
         results = self._overlay._results_provider() if self._overlay else None
         if results:
-            items = results.items if isinstance(results, DetectorResult) else (results.get("items", []) if isinstance(results, dict) else [])
+            items = results.items if isinstance(results, DetectorResult) else (
+                results.get("items", []) if isinstance(results, dict) else [])
         for it in items:
             # if your pose model still uses class_index 0 for person, keep this
             cls = int(it.class_index)
@@ -624,6 +664,8 @@ class GstVideoRunner(GstBaseRunner):
             except Exception:
                 lm_pts = None
 
+            if not lm_pts:
+                continue
             force_head = {0,1,2,3,4}      # nose/eyes/ears
             pts17 = []
 
@@ -651,11 +693,30 @@ class GstVideoRunner(GstBaseRunner):
             block = 8
 
             # pixelate body (from landmarks)
-            if body:
+            if body and self._pixelate:
                 self._pixelate_roi(frame, *body, block=block)
-            if head:
+            if head and self._pixelate:
                 self._pixelate_roi(frame, *head, block=block)
+            if self._detect_fall and self._hand_touching_head(pts17, ox, oy, bw, bh):
+                self._fall_alert = True
+                self._fall_alert_countdown = self._fall_alert_frames
 
+        # PUT FALL Alert
+        if self._fall_alert and self._detect_fall:
+            cv2.putText(
+                frame,
+                "FALL ALERT",
+                (30, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.6,
+                (255, 0, 0),  # red in RGB
+                4,
+                cv2.LINE_AA,
+            )
+
+            self._fall_alert_countdown -= 1
+            if self._fall_alert_countdown <= 0:
+                self._fall_alert = False
         # push to display
         if not getattr(self, "_appsrc", None):
             return Gst.FlowReturn.ERROR

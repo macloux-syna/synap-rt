@@ -44,34 +44,38 @@ pip install -e synap-rt
 A SynapRT pipeline requires three key components: a task, a SyNAP model, and an input source. Additionally, it is recommended to define a handler function to process inference results or integrate them into a broader workflow.
 
 ```python
-"""A simple object detection pipeline example."""
-
-import json
-import sys
- 
+import argparse
 from synapRT.pipelines import pipeline
- 
- 
+
+
 def main():
- 
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
- 
+    parser = argparse.ArgumentParser(description="Object detection pipeline")
+
+    parser.add_argument("-v", "--video", required=True, help="Input video source (file, cam, rtsp)")
+    parser.add_argument("-p", "--pixelate", action="store_true", help="Enable pixelation")
+    parser.add_argument("-f", "--fall", action="store_true", help="Enable fall detection")
+    parser.add_argument("-o", "--output", help="Output file path")
+
+    args = parser.parse_args()
+
     def handle_results(results, inference_time):
         print(f"Inference Time: {inference_time:.0f} ms")
- 
+
     pipe = pipeline(
         task="object-detection",
         model="/usr/share/synap/models/object_detection/body_pose/model/yolov8s-pose/model.synap",
-        save_file=output_file,
+        pixelate=args.pixelate,
+        detect_fall=args.fall,
+        save_file=args.output,
     )
- 
-    print(f"Starting Object Detection Stream.")
-    if output_file:
-        print(f"Recording to: {output_file} (Press Ctrl+C to save and exit)")
- 
-    pipe(sys.argv[1])
- 
- 
+
+    print("Starting Object Detection Stream.")
+    if args.output:
+        print(f"Recording to: {args.output} (Press Ctrl+C to save and exit)")
+
+    pipe(args.video)
+
+
 if __name__ == "__main__":
     main()
 ```
@@ -80,7 +84,7 @@ Run the above pipeline with:
 ```bash
 python3 simple.py <input>
 ```
-`<input>` can be image(s), or a video source like camera, MP4 file, or RTSP stream. 
+`<input>` can be image(s), or a video source like camera, MP4 file, or RTSP stream.
 
 > [!TIP]
 > To adapt this code for other tasks (such as image classification), simply update the `task` and `model` parameters.
@@ -93,4 +97,3 @@ Explore the [examples](examples/) directory for additional pipeline use cases, s
 * Polling a pipeline for results instead of using a handler function.
 
 For application-level implementations using SynapRT pipelines, check out the [official Astra examples repository](https://github.com/synaptics-synap/examples).
-
