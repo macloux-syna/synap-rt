@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
 Run the above pipeline with:
 ```bash
-python3 simple.py <input>
+python simple.py -v /dev/video8 -p -f
 ```
 `<input>` can be image(s), or a video source like camera, MP4 file, or RTSP stream.
 
